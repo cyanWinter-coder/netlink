@@ -176,6 +176,112 @@ type flagString struct {
 	s string
 }
 
+// RouteOp selects the netlink operation applied to a Route inside a batch.
+type RouteOp int
+
+const (
+	// RouteOpAdd creates a route, failing if a matching one already exists.
+	// Equivalent to `ip route add`.
+	RouteOpAdd RouteOp = iota
+	// RouteOpReplace creates or replaces a route.
+	// Equivalent to `ip route replace`.
+	RouteOpReplace
+	// RouteOpChange replaces an existing route, failing if none matches.
+	// Equivalent to `ip route change`.
+	RouteOpChange
+	// RouteOpDelete deletes a matching route.
+	// Equivalent to `ip route del`.
+	RouteOpDelete
+)
+
+// RouteBatchItem is one element of a route batch: the operation to apply and
+// the route to apply it to.
+type RouteBatchItem struct {
+	Op    RouteOp
+	Route *Route
+}
+
+// RouteBatchItemError reports the failure of a single batch item, identified by
+// its stable index in the input slice.
+type RouteBatchItemError struct {
+	Index int
+	Op    RouteOp
+	Err   error
+}
+
+func (e *RouteBatchItemError) Error() string {
+	return fmt.Sprintf("route batch item %d (%s): %v", e.Index, e.Op, e.Err)
+}
+
+func (e *RouteBatchItemError) Unwrap() error { return e.Err }
+
+// RouteRollbackError reports that undoing an already applied batch item
+// failed. Index identifies the original item; the rollback walks committed
+// items in reverse order.
+type RouteRollbackError struct {
+	Index int
+	Op    RouteOp
+	Err   error
+}
+
+func (e *RouteRollbackError) Error() string {
+	return fmt.Sprintf("route batch rollback of item %d (%s): %v", e.Index, e.Op, e.Err)
+}
+
+func (e *RouteRollbackError) Unwrap() error { return e.Err }
+
+// RouteBatchError is the aggregate result of a failed route batch. ItemErrors
+// holds one entry per request the kernel rejected (in index order);
+// RollbackErrors holds the errors encountered while undoing the committed
+// items, also in the order they were attempted (reverse commit order). Either
+// slice may be empty: a pre-send validation failure produces neither, and a
+// clean rollback leaves RollbackErrors empty.
+type RouteBatchError struct {
+	ItemErrors     []*RouteBatchItemError
+	RollbackErrors []*RouteRollbackError
+}
+
+func (e *RouteBatchError) Error() string {
+	switch {
+	case len(e.ItemErrors) > 0 && len(e.RollbackErrors) > 0:
+		return fmt.Sprintf("route batch failed: %d item error(s), %d rollback error(s)",
+			len(e.ItemErrors), len(e.RollbackErrors))
+	case len(e.ItemErrors) > 0:
+		return fmt.Sprintf("route batch failed: %d item error(s)", len(e.ItemErrors))
+	case len(e.RollbackErrors) > 0:
+		return fmt.Sprintf("route batch aborted: %d rollback error(s)", len(e.RollbackErrors))
+	default:
+		return "route batch failed"
+	}
+}
+
+// Unwrap returns the first item error so errors.Is/As keep working against the
+// underlying kernel errno (e.g. unix.EEXIST, unix.ESRCH).
+func (e *RouteBatchError) Unwrap() error {
+	if len(e.ItemErrors) > 0 {
+		return e.ItemErrors[0].Err
+	}
+	if len(e.RollbackErrors) > 0 {
+		return e.RollbackErrors[0].Err
+	}
+	return nil
+}
+
+func (op RouteOp) String() string {
+	switch op {
+	case RouteOpAdd:
+		return "add"
+	case RouteOpReplace:
+		return "replace"
+	case RouteOpChange:
+		return "change"
+	case RouteOpDelete:
+		return "delete"
+	default:
+		return "unknown"
+	}
+}
+
 // RouteUpdate is sent when a route changes - type is RTM_NEWROUTE or RTM_DELROUTE
 
 // NlFlags is only non-zero for RTM_NEWROUTE, the following flags can be set:
