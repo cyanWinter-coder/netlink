@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -173,9 +172,14 @@ var (
 	handle2   *Handle
 	ns1       netns.NsHandle
 	ns2       netns.NsHandle
-	done      uint32
-	initError error
-	once      sync.Once
+	// parallelWg tracks every parallel test worker so the shared handles are
+	// only closed once all workers have finished their requests. The previous
+	// atomic-counter approach closed the handles as soon as the last worker
+	// incremented the counter, which raced the other workers' deferred
+	// teardown once Close became strict about in-flight requests.
+	parallelWg sync.WaitGroup
+	initError  error
+	once       sync.Once
 )
 
 func getXfrmState(thread int) *XfrmState {
@@ -229,35 +233,51 @@ func initParallel() {
 	}
 }
 
-func parallelDone() {
-	atomic.AddUint32(&done, 1)
-	if done == numThread {
-		if ns1.IsOpen() {
-			ns1.Close()
-		}
-		if ns2.IsOpen() {
-			ns2.Close()
-		}
-		if handle1 != nil {
-			handle1.Close()
-		}
-		if handle2 != nil {
-			handle2.Close()
-		}
+// parallelTeardown closes the shared namespaces and handles. It is registered
+// once and runs only after every parallel worker has called Done on
+// parallelWg, so no request can be in flight when the handles close. It then
+// resets the package-level coordination state so the tests are re-entrant when
+// run repeatedly within one test binary (e.g. `go test -count=N`).
+func parallelTeardown() {
+	parallelWg.Wait()
+	if ns1.IsOpen() {
+		ns1.Close()
 	}
+	if ns2.IsOpen() {
+		ns2.Close()
+	}
+	if handle1 != nil {
+		handle1.Close()
+	}
+	if handle2 != nil {
+		handle2.Close()
+	}
+	handle1, handle2 = nil, nil
+	ns1, ns2 = netns.None(), netns.None()
+	once = sync.Once{}
+	initError = nil
 }
 
 // Do few route and xfrm operation on the two handles in parallel
 func runParallelTests(t *testing.T, thread int) {
 	skipUnlessRoot(t)
-	defer parallelDone()
 
 	t.Parallel()
 
-	once.Do(initParallel)
+	// Register the worker's participation before releasing the gate and before
+	// any cleanup can run: parallelWg is pre-sized to numThread, so the single
+	// teardown (registered on the initializing test) always waits for every
+	// worker regardless of scheduling order.
+	parallelWg.Add(1)
+	once.Do(func() {
+		initParallel()
+		t.Cleanup(parallelTeardown)
+	})
 	if initError != nil {
+		parallelWg.Done()
 		t.Fatal(initError)
 	}
+	defer parallelWg.Done()
 
 	state := getXfrmState(thread)
 	policy := getXfrmPolicy(thread)

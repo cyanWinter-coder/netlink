@@ -67,6 +67,12 @@ var EnableErrorMessageReporting bool = false
 // indicating that the results may be incomplete or inconsistent.
 var ErrDumpInterrupted = errDumpInterrupted{}
 
+// ErrHandleClosed is returned when a request is submitted to a socket handle
+// that has already been closed, or when Close races with a request in flight.
+// It is a deterministic failure: no message is sent on the socket and nothing
+// is written into another network namespace.
+var ErrHandleClosed = errors.New("netlink socket handle is closed")
+
 // errDumpInterrupted is an error type, used to report that NLM_F_DUMP_INTR was
 // set in a netlink response.
 type errDumpInterrupted struct{}
@@ -486,6 +492,26 @@ type NetlinkRequest struct {
 	Sockets map[int]*SocketHandle
 
 	RetryInterrupted bool
+
+	// namespace is the network namespace a short-lived fallback socket must be
+	// opened in. It is ignored when the request runs on a shared socket from
+	// Sockets, which carries its own namespace. A non-positive value means the
+	// caller's current namespace.
+	namespace int
+	// closed, when non-nil, is consulted before opening a fallback socket. If it
+	// reports the owning handle as closed the request fails with ErrHandleClosed
+	// instead of opening a socket.
+	closed func() bool
+}
+
+// WithNamespace records the network namespace (an open nsfs file descriptor, or
+// a non-positive value for the caller's current namespace) that short-lived
+// fallback sockets for this request must be opened in, together with a callback
+// that reports whether the owning handle has been closed.
+func (req *NetlinkRequest) WithNamespace(ns int, closed func() bool) *NetlinkRequest {
+	req.namespace = ns
+	req.closed = closed
+	return req
 }
 
 // Serialize the Netlink Request into a byte array
@@ -590,15 +616,33 @@ func (req *NetlinkRequest) executeIter(sockType int, resType uint16, f func(msg 
 		err error
 	)
 
+	// release scopes everything that must be undone before returning: the
+	// namespace entered for this request and any reference taken on a shared
+	// socket. It is a no-op until one of those has been acquired.
+	release := func() {}
+	defer func() { release() }()
+
+	var sh *SocketHandle
 	if req.Sockets != nil {
-		if sh, ok := req.Sockets[sockType]; ok {
-			s = sh.Socket
-			req.Seq = atomic.AddUint32(&sh.Seq, 1)
+		if h, ok := req.Sockets[sockType]; ok {
+			sh = h
 		}
 	}
-	sharedSocket := s != nil
+	sharedSocket := sh != nil
 
-	if s == nil {
+	if sh == nil {
+		// Short-lived fallback socket. Open it inside the request namespace so
+		// the caller thread's current namespace can never leak into the socket.
+		if req.closed != nil && req.closed() {
+			return ErrHandleClosed
+		}
+		var leave func()
+		leave, err = enterNetns(req.namespace)
+		if err != nil {
+			return err
+		}
+		release = leave
+
 		s, err = getNetlinkSocket(sockType)
 		if err != nil {
 			return err
@@ -617,8 +661,18 @@ func (req *NetlinkRequest) executeIter(sockType int, resType uint16, f func(msg 
 
 		defer s.Close()
 	} else {
-		s.Lock()
-		defer s.Unlock()
+		// Pin the socket and, if it has a namespace, pin the calling OS thread
+		// and move it into that namespace for the whole request. Every
+		// concurrent request takes its own thread, so they never switch the
+		// namespace under each other.
+		var leave func()
+		leave, err = sh.Acquire()
+		if err != nil {
+			return err
+		}
+		release = leave
+		s = sh.Socket
+		req.Seq = sh.nextSeq()
 	}
 
 	if err := s.Send(req); err != nil {
@@ -813,65 +867,84 @@ func NewNetlinkSocketFromFd(fd int) (*NetlinkSocket, error) {
 // moves back into it when done. If newNs is close, the socket will be opened
 // in the current network namespace.
 func GetNetlinkSocketAt(newNs, curNs netns.NsHandle, protocol int) (*NetlinkSocket, error) {
-	c, err := executeInNetns(newNs, curNs)
+	restore, err := enterNetnsFrom(newNs, curNs)
 	if err != nil {
 		return nil, err
 	}
-	defer c()
+	defer restore()
 	return getNetlinkSocket(protocol)
 }
 
-// executeInNetns sets execution of the code following this call to the
-// network namespace newNs, then moves the thread back to curNs if open,
-// otherwise to the current netns at the time the function was invoked
-// In case of success, the caller is expected to execute the returned function
-// at the end of the code that needs to be executed in the network namespace.
-// Example:
+// enterNetns works like enterNetnsFrom but always restores the thread to the
+// namespace it had at the time of the call. The ns argument is an open nsfs
+// file descriptor; a non-positive value leaves the thread in its current
+// namespace and returns a no-op restore function.
+func enterNetns(ns int) (func(), error) {
+	if ns <= 0 {
+		return func() {}, nil
+	}
+	return enterNetnsFrom(netns.NsHandle(ns), netns.None())
+}
+
+// enterNetnsFrom pins the calling goroutine to its OS thread and moves that
+// thread into newNs. The returned function moves the thread back to curNs (or
+// to the namespace captured at entry when curNs is closed), releases the
+// thread and closes every namespace descriptor this call acquired. It must
+// always be invoked, also on the caller's error paths. When newNs is closed
+// nothing is switched and the returned function is a no-op.
 //
-//	func jobAt(...) error {
-//	     d, err := executeInNetns(...)
-//	     if err != nil { return err}
-//	     defer d()
-//	     < code which needs to be executed in specific netns>
-//	 }
-//
-// TODO: his function probably belongs to netns pkg.
-func executeInNetns(newNs, curNs netns.NsHandle) (func(), error) {
+// Pinning the thread matters: setns(2) changes the namespace of one thread,
+// not of the goroutine, so every request takes its own enter/restore pair and
+// concurrent requests never observe each other's namespace.
+func enterNetnsFrom(newNs, curNs netns.NsHandle) (func(), error) {
+	if !newNs.IsOpen() {
+		return func() {}, nil
+	}
+
+	runtime.LockOSThread()
+
 	var (
-		err       error
-		moveBack  func(netns.NsHandle) error
-		closeNs   func() error
-		unlockThd func()
+		savedNs   netns.NsHandle = netns.None()
+		ownsSaved bool
 	)
-	restore := func() {
-		// order matters
-		if moveBack != nil {
-			moveBack(curNs)
+	if !curNs.IsOpen() {
+		got, err := netns.Get()
+		if err != nil {
+			runtime.UnlockOSThread()
+			return nil, fmt.Errorf("could not get current namespace while entering netlink namespace: %v", err)
 		}
-		if closeNs != nil {
-			closeNs()
-		}
-		if unlockThd != nil {
-			unlockThd()
-		}
+		savedNs = got
+		ownsSaved = true
+	} else {
+		savedNs = curNs
 	}
-	if newNs.IsOpen() {
-		runtime.LockOSThread()
-		unlockThd = runtime.UnlockOSThread
-		if !curNs.IsOpen() {
-			if curNs, err = netns.Get(); err != nil {
-				restore()
-				return nil, fmt.Errorf("could not get current namespace while creating netlink socket: %v", err)
-			}
-			closeNs = curNs.Close
+
+	if err := netns.Set(newNs); err != nil {
+		if ownsSaved {
+			_ = savedNs.Close()
 		}
-		if err := netns.Set(newNs); err != nil {
-			restore()
-			return nil, fmt.Errorf("failed to set into network namespace %d while creating netlink socket: %v", newNs, err)
-		}
-		moveBack = netns.Set
+		runtime.UnlockOSThread()
+		return nil, fmt.Errorf("failed to set into network namespace %d while entering netlink namespace: %v", newNs, err)
 	}
-	return restore, nil
+
+	restored := false
+	return func() {
+		if restored {
+			return
+		}
+		restored = true
+		// Restore first, then drop the saved descriptor, then release the
+		// thread, so the thread never leaves this function still in newNs.
+		if err := netns.Set(savedNs); err != nil {
+			// A thread that cannot return to its original namespace must not
+			// be reused by another goroutine; keep it pinned.
+			return
+		}
+		if ownsSaved {
+			_ = savedNs.Close()
+		}
+		runtime.UnlockOSThread()
+	}, nil
 }
 
 // Create a netlink socket with a given protocol (e.g. NETLINK_ROUTE)
@@ -909,11 +982,11 @@ func Subscribe(protocol int, groups ...uint) (*NetlinkSocket, error) {
 // namespace in which the socket would be opened (newNs). Then control goes back
 // to curNs if open, otherwise to the netns at the time this function was called.
 func SubscribeAt(newNs, curNs netns.NsHandle, protocol int, groups ...uint) (*NetlinkSocket, error) {
-	c, err := executeInNetns(newNs, curNs)
+	restore, err := enterNetnsFrom(newNs, curNs)
 	if err != nil {
 		return nil, err
 	}
-	defer c()
+	defer restore()
 	return Subscribe(protocol, groups...)
 }
 
@@ -1164,16 +1237,106 @@ func netlinkRouteAttrAndValue(b []byte) (*unix.RtAttr, []byte, int, error) {
 }
 
 // SocketHandle contains the netlink socket and the associated
-// sequence counter for a specific netlink family
+// sequence counter for a specific netlink family.
+//
+// A SocketHandle may additionally carry the network namespace the socket lives
+// in. When it does, every acquire pins the calling goroutine to its OS thread
+// and moves that thread into the namespace for the duration of the request, so
+// requests sharing the socket never switch the namespace under each other.
+//
+// Close is idempotent and blocks until every request that acquired the handle
+// has released it; the underlying socket file is only closed once the reference
+// count is back to zero. Requests arriving after Close fail with
+// ErrHandleClosed and never send on the socket.
 type SocketHandle struct {
-	Seq    uint32
+	Seq atomic.Uint32
+
 	Socket *NetlinkSocket
+
+	// namespace is the nsfs descriptor the calling thread is moved into while
+	// a request is in flight. The zero value (and any negative value) means
+	// "no namespace switching": sockets opened in the caller's current
+	// namespace and externally supplied (e.g. Android, never bound) sockets
+	// keep this value. A positive value is an open nsfs file descriptor.
+	namespace int
+
+	// inFlight counts requests currently holding a reference.
+	inFlight sync.WaitGroup
+	// closeMu makes the closed transition and the reference acquisition atomic.
+	closeMu   sync.RWMutex
+	closed    bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
-// Close closes the netlink socket
-func (sh *SocketHandle) Close() error {
-	if sh.Socket != nil {
-		return sh.Socket.Close()
+// NewSocketHandle wraps an existing socket and records the network namespace
+// (an open nsfs file descriptor, or a non-positive value for no namespace
+// switching) its requests must run in. The handle does not take ownership of
+// ns; the caller keeps the right to close it once every handle using it is
+// closed.
+func NewSocketHandle(socket *NetlinkSocket, ns int) *SocketHandle {
+	return &SocketHandle{Socket: socket, namespace: ns}
+}
+
+// nextSeq returns the next per-socket sequence number. It is only valid while
+// the caller holds a reference obtained via Acquire.
+func (sh *SocketHandle) nextSeq() uint32 {
+	return sh.Seq.Add(1)
+}
+
+// Acquire takes a reference on the handle and, when the handle carries a
+// namespace, pins the calling thread into it. The returned function releases
+// the reference and restores the thread. If the handle is closed (or closes
+// before the reference is taken) Acquire returns ErrHandleClosed and sends
+// nothing on the socket.
+func (sh *SocketHandle) Acquire() (func(), error) {
+	sh.closeMu.RLock()
+	if sh.closed {
+		sh.closeMu.RUnlock()
+		return nil, ErrHandleClosed
 	}
-	return nil
+	if sh.Socket == nil {
+		sh.closeMu.RUnlock()
+		return nil, ErrHandleClosed
+	}
+	sh.inFlight.Add(1)
+	sh.closeMu.RUnlock()
+
+	releaseNS := func() {}
+	if sh.namespace > 0 {
+		restore, err := enterNetns(sh.namespace)
+		if err != nil {
+			sh.inFlight.Done()
+			return nil, err
+		}
+		releaseNS = restore
+	}
+
+	sh.Socket.Lock()
+	return func() {
+		sh.Socket.Unlock()
+		releaseNS()
+		sh.inFlight.Done()
+	}, nil
+}
+
+// Close marks the handle closed, waits for every request in flight to finish,
+// and then closes the underlying socket. It is safe to call concurrently with
+// request execution and may be called any number of times; only the first call
+// can return a non-nil error. A nil Socket is closed without error.
+func (sh *SocketHandle) Close() error {
+	sh.closeOnce.Do(func() {
+		sh.closeMu.Lock()
+		sh.closed = true
+		sh.closeMu.Unlock()
+
+		// Wait with no lock held: in-flight requests hold their reference and
+		// must be able to finish and release it without taking closeMu.
+		sh.inFlight.Wait()
+
+		if sh.Socket != nil {
+			sh.closeErr = sh.Socket.Close()
+		}
+	})
+	return sh.closeErr
 }

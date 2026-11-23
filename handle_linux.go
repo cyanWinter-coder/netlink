@@ -67,6 +67,18 @@ type Handle struct {
 	options HandleOptions
 
 	lookupByDump atomic.Bool
+
+	// namespace is the network namespace every request on this handle is
+	// explicitly bound to, held via a duplicated nsfs descriptor the handle
+	// owns. A non-positive value means no per-request switching: handles on
+	// the caller's current namespace and handles built from caller-supplied
+	// sockets keep the zero value.
+	namespace int
+
+	closeMu   sync.RWMutex
+	closed    bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // DisableVFInfoCollection configures the handle to skip VF information fetching
@@ -103,8 +115,23 @@ func GetSocketTimeout() time.Duration {
 
 // SupportsNetlinkFamily reports whether the passed netlink family is supported by this Handle
 func (h *Handle) SupportsNetlinkFamily(nlFamily int) bool {
+	h.closeMu.RLock()
+	defer h.closeMu.RUnlock()
 	_, ok := h.sockets[nlFamily]
 	return ok
+}
+
+// socketHandles returns a snapshot of the handle's socket handles under the
+// close lock. Callers iterate the snapshot instead of the live map, so a
+// concurrent Close cannot race the traversal.
+func (h *Handle) socketHandles() []*nl.SocketHandle {
+	h.closeMu.RLock()
+	defer h.closeMu.RUnlock()
+	handles := make([]*nl.SocketHandle, 0, len(h.sockets))
+	for _, sh := range h.sockets {
+		handles = append(handles, sh)
+	}
+	return handles
 }
 
 // NewHandle returns a netlink handle on the current network namespace.
@@ -125,7 +152,7 @@ func (h *Handle) SetSocketTimeout(to time.Duration) error {
 		return fmt.Errorf("invalid timeout, minimul value is %s", time.Microsecond)
 	}
 	tv := unix.NsecToTimeval(to.Nanoseconds())
-	for _, sh := range h.sockets {
+	for _, sh := range h.socketHandles() {
 		if err := sh.Socket.SetSendTimeout(&tv); err != nil {
 			return err
 		}
@@ -144,7 +171,7 @@ func (h *Handle) SetSocketReceiveBufferSize(size int, force bool) error {
 	if force {
 		opt = unix.SO_RCVBUFFORCE
 	}
-	for _, sh := range h.sockets {
+	for _, sh := range h.socketHandles() {
 		fd := sh.Socket.GetFd()
 		err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, opt, size)
 		if err != nil {
@@ -158,9 +185,10 @@ func (h *Handle) SetSocketReceiveBufferSize(size int, force bool) error {
 // socket in the netlink handle. The retrieved value should be the
 // double to the one set for SetSocketReceiveBufferSize.
 func (h *Handle) GetSocketReceiveBufferSize() ([]int, error) {
-	results := make([]int, len(h.sockets))
+	handles := h.socketHandles()
+	results := make([]int, len(handles))
 	i := 0
-	for _, sh := range h.sockets {
+	for _, sh := range handles {
 		fd := sh.Socket.GetFd()
 		size, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF)
 		if err != nil {
@@ -174,7 +202,7 @@ func (h *Handle) GetSocketReceiveBufferSize() ([]int, error) {
 
 // SetStrictCheck sets the strict check socket option for each socket in the netlink handle. Returns early if any set operation fails
 func (h *Handle) SetStrictCheck(state bool) error {
-	for _, sh := range h.sockets {
+	for _, sh := range h.socketHandles() {
 		var stateInt int = 0
 		if state {
 			stateInt = 1
@@ -241,13 +269,44 @@ func NewHandleFromSockets(sockets map[int]*nl.SocketHandle, opts HandleOptions) 
 	}
 }
 
+// dupNsHandle duplicates an open namespace descriptor so the handle owns its
+// own reference for its whole lifetime. The caller may close its NsHandle as
+// soon as the constructor returns; the duplicate keeps the namespace alive and
+// is closed by Close. A closed handle yields 0, meaning no per-request
+// namespace switching.
+func dupNsHandle(ns netns.NsHandle) (netns.NsHandle, error) {
+	if !ns.IsOpen() {
+		return netns.None(), nil
+	}
+	dup, err := unix.FcntlInt(uintptr(ns), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return netns.None(), fmt.Errorf("duplicating network namespace descriptor: %w", err)
+	}
+	return netns.NsHandle(dup), nil
+}
+
 // newHandle opens a socket for each requested netlink family in the network namespace newNs and
 // returns a Handle that owns them. curNs is the namespace to switch back to when done; if it is
 // closed, the current namespace is used. Without nlFamilies every supported family is opened.
 func newHandle(newNs, curNs netns.NsHandle, opts HandleOptions, nlFamilies ...int) (*Handle, error) {
+	// Take a private reference to the namespace up front. If the caller closes
+	// newNs afterwards, requests still have a valid descriptor and Close can
+	// detect the namespace going away deterministically instead of racing it.
+	nsRef, err := dupNsHandle(newNs)
+	if err != nil {
+		return nil, err
+	}
+	// Keep 0 as the canonical "no per-request switching" value: dupNsHandle
+	// returns netns.None() (-1) for a closed input.
+	nsFd := 0
+	if nsRef.IsOpen() {
+		nsFd = int(nsRef)
+	}
+
 	h := &Handle{
-		sockets: map[int]*nl.SocketHandle{},
-		options: opts,
+		sockets:   map[int]*nl.SocketHandle{},
+		options:   opts,
+		namespace: nsFd,
 	}
 	fams := nl.SupportedNlFamilies
 	if len(nlFamilies) != 0 {
@@ -255,25 +314,54 @@ func newHandle(newNs, curNs netns.NsHandle, opts HandleOptions, nlFamilies ...in
 	}
 
 	for _, f := range fams {
-		s, err := nl.GetNetlinkSocketAt(newNs, curNs, f)
+		s, err := nl.GetNetlinkSocketAt(nsRef, curNs, f)
 		if err != nil {
+			// Release anything already opened plus the namespace reference so
+			// a failed constructor never leaves a handle behind.
+			for _, sh := range h.sockets {
+				_ = sh.Close()
+			}
+			if nsRef.IsOpen() {
+				_ = nsRef.Close()
+			}
 			return nil, err
 		}
-		h.sockets[f] = &nl.SocketHandle{Socket: s}
+		h.sockets[f] = nl.NewSocketHandle(s, nsFd)
 	}
 	return h, nil
 }
 
-// Close closes all netlink sockets held by this Handle.
+// Close closes all netlink sockets held by this Handle and releases its
+// network namespace reference. It waits for requests already in flight to
+// finish, so the underlying socket files are only closed once their reference
+// count reaches zero. Close is idempotent: repeated calls return the error of
+// the first one and never touch the files again.
 func (h *Handle) Close() error {
-	var firstErr error
-	for _, sh := range h.sockets {
-		if err := sh.Close(); err != nil && firstErr == nil {
-			firstErr = err
+	h.closeOnce.Do(func() {
+		h.closeMu.Lock()
+		h.closed = true
+		sockets := h.sockets
+		ns := h.namespace
+		h.sockets = nil
+		h.namespace = 0
+		h.closeMu.Unlock()
+
+		// Close without the lock: SocketHandle.Close blocks until in-flight
+		// requests drain, and those requests only take the read lock briefly to
+		// build their request, so holding closeMu here would deadlock.
+		for _, sh := range sockets {
+			if err := sh.Close(); err != nil && h.closeErr == nil {
+				h.closeErr = err
+			}
 		}
-	}
-	h.sockets = nil
-	return firstErr
+
+		if ns > 0 {
+			if err := unix.Close(ns); err != nil && h.closeErr == nil {
+				h.closeErr = err
+			}
+		}
+	})
+	return h.closeErr
 }
 
 // Delete releases the resources allocated to this handle
@@ -285,20 +373,39 @@ func (h *Handle) Delete() {
 }
 
 func (h *Handle) newNetlinkRequest(proto, flags int) *nl.NetlinkRequest {
+	// Snapshot everything the request may read while it runs under the close
+	// lock, so a concurrent Close cannot race the field accesses. The closed
+	// flag is captured into the request: requests built after Close fail at
+	// execution with ErrHandleClosed instead of touching a released socket.
+	h.closeMu.RLock()
+	sockets := h.sockets
+	ns := h.namespace
+	closed := h.closed
+	h.closeMu.RUnlock()
+
 	// Do this so that package API still use nl package variable nextSeqNr
-	if h.sockets == nil {
+	if sockets == nil {
+		// Socket-less handle used by the package-level functions and, after
+		// Close, by closed handles. The closed callback makes the latter fail
+		// with ErrHandleClosed instead of opening a fallback socket.
 		req := nl.NewNetlinkRequest(proto, flags)
 		req.RetryInterrupted = h.options.RetryInterrupted
+		req.WithNamespace(ns, func() bool { return closed })
 		return req
 	}
-	return &nl.NetlinkRequest{
+	req := &nl.NetlinkRequest{
 		NlMsghdr: unix.NlMsghdr{
 			Len:   uint32(unix.SizeofNlMsghdr),
 			Type:  uint16(proto),
 			Flags: unix.NLM_F_REQUEST | uint16(flags),
 		},
-		Sockets: h.sockets,
+		Sockets: sockets,
 
 		RetryInterrupted: h.options.RetryInterrupted,
 	}
+	// Bind fallback sockets to the handle's namespace and make requests after
+	// Close fail deterministically instead of opening a socket in whatever
+	// namespace the calling thread happens to be in.
+	req.WithNamespace(ns, func() bool { return closed })
+	return req
 }
