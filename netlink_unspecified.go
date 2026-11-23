@@ -3,7 +3,10 @@
 
 package netlink
 
-import "net"
+import (
+	"context"
+	"net"
+)
 
 func LinkSetUp(link Link) error {
 	return ErrNotImplemented
@@ -182,6 +185,10 @@ func SetFlood(link Link, mode bool) error {
 }
 
 func LinkList() ([]Link, error) {
+	return nil, ErrNotImplemented
+}
+
+func LinkListWithContext(ctx context.Context) ([]Link, error) {
 	return nil, ErrNotImplemented
 }
 

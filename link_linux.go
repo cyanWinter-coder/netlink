@@ -2,6 +2,7 @@ package netlink
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -2144,7 +2145,24 @@ func execGetLink(req *nl.NetlinkRequest) (Link, error) {
 		return LinkDeserialize(nil, msgs[0])
 
 	default:
-		return nil, fmt.Errorf("More than one link found")
+		// A concurrent change can make the kernel answer with several
+		// generations of the requested link. Fold them into the newest
+		// complete image, mirroring LinkList, instead of failing.
+		agg := newLinkDumpAggregator()
+		for _, m := range msgs {
+			agg.add(nil, m)
+		}
+		links, aggErr := agg.result()
+		if len(links) == 0 {
+			if aggErr != nil {
+				return nil, aggErr
+			}
+			return nil, LinkNotFoundError{fmt.Errorf("Link not found")}
+		}
+		if len(links) > 1 {
+			return nil, fmt.Errorf("More than one link found")
+		}
+		return links[0], aggErr
 	}
 }
 
@@ -2532,9 +2550,33 @@ func LinkList() ([]Link, error) {
 // LinkList gets a list of link devices.
 // Equivalent to: `ip link show`
 //
+// The dump is folded into a single consistent view before it is returned:
+// interfaces that change while the dump is in flight may be reported by the
+// kernel more than once, in which case only the newest complete record of
+// each interface is published. Records that cannot be decoded (for example
+// truncated attributes) are skipped and reported as a joined error of
+// [*LinkRecordError] values without hiding the remaining links.
+//
 // If the returned error is [ErrDumpInterrupted], results may be inconsistent
 // or incomplete.
 func (h *Handle) LinkList() ([]Link, error) {
+	return h.LinkListWithContext(context.Background())
+}
+
+// LinkListWithContext gets a list of link devices like LinkList, but aborts
+// the dump when ctx is done: it stops reading kernel messages, discards the
+// records buffered so far and returns ctx.Err().
+//
+// Cancellation of a Handle with shared sockets (created by NewHandle and
+// friends) is observed between receives; package-level LinkListWithContext
+// and socket-less handles interrupt a blocked receive immediately.
+func LinkListWithContext(ctx context.Context) ([]Link, error) {
+	return pkgHandle().LinkListWithContext(ctx)
+}
+
+// LinkListWithContext gets a list of link devices like LinkList, but aborts
+// the dump when ctx is done. See the package-level LinkListWithContext.
+func (h *Handle) LinkListWithContext(ctx context.Context) ([]Link, error) {
 	// NOTE(vish): This duplicates functionality in net/iface_linux.go, but we need
 	//             to get the message ourselves to parse link type.
 	req := h.newNetlinkRequest(unix.RTM_GETLINK, unix.NLM_F_DUMP)
@@ -2546,21 +2588,21 @@ func (h *Handle) LinkList() ([]Link, error) {
 		req.AddData(nl.NewRtAttr(unix.IFLA_EXT_MASK, nl.Uint32Attr(nl.RTEXT_FILTER_VF)))
 	}
 
-	msgs, executeErr := req.Execute(unix.NETLINK_ROUTE, unix.RTM_NEWLINK)
+	agg := newLinkDumpAggregator()
+	executeErr := req.ExecuteIterFullContext(ctx, unix.NETLINK_ROUTE, unix.RTM_NEWLINK, agg.addMessage)
 	if executeErr != nil && !errors.Is(executeErr, ErrDumpInterrupted) {
 		return nil, executeErr
 	}
 
-	var res []Link
-	for _, m := range msgs {
-		link, err := LinkDeserialize(nil, m)
-		if err != nil {
-			return nil, err
-		}
-		res = append(res, link)
+	links, aggErr := agg.result()
+	switch {
+	case aggErr == nil:
+		return links, executeErr
+	case executeErr == nil:
+		return links, aggErr
+	default:
+		return links, errors.Join(executeErr, aggErr)
 	}
-
-	return res, executeErr
 }
 
 // LinkUpdate is used to pass information back from LinkSubscribe()

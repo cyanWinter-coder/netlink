@@ -3,6 +3,7 @@ package nl
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -584,7 +585,75 @@ func (req *NetlinkRequest) ExecuteIter(sockType int, resType uint16, f func(msg 
 	return err
 }
 
+// ExecuteIterFull is like ExecuteIter, but the callback receives the complete
+// netlink message, header included, so callers can correlate records with the
+// request sequence number they arrived on.
+func (req *NetlinkRequest) ExecuteIterFull(sockType int, resType uint16, f func(msg syscall.NetlinkMessage) bool) error {
+	return req.ExecuteIterFullContext(context.Background(), sockType, resType, f)
+}
+
+// ExecuteIterFullContext is like ExecuteIterFull, but the dump is aborted as
+// soon as ctx is done: no further kernel messages are read, anything buffered
+// so far is discarded by the caller and ctx.Err() is returned.
+//
+// When the request runs on a dedicated socket (no shared Sockets configured),
+// cancellation closes that socket, interrupting a blocked Receive. On a shared
+// socket the socket must stay usable for other requests, so cancellation is
+// observed between receives instead.
+//
+// Thread safety: same as ExecuteIter; the callback must not call back into
+// the netlink API.
+func (req *NetlinkRequest) ExecuteIterFullContext(ctx context.Context, sockType int, resType uint16, f func(msg syscall.NetlinkMessage) bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !req.RetryInterrupted {
+		return req.executeIterFull(ctx, sockType, resType, f)
+	}
+
+	// Buffer messages until a complete dump is received and only then pass
+	// them to the callback, mirroring ExecuteIter.
+	const attempts = 10
+	var lastRes []syscall.NetlinkMessage
+	for range attempts {
+		var res []syscall.NetlinkMessage
+		err := req.executeIterFull(ctx, sockType, resType, func(msg syscall.NetlinkMessage) bool {
+			res = append(res, msg)
+			return true
+		})
+		if err == nil {
+			for _, msg := range res {
+				if cont := f(msg); !cont {
+					break
+				}
+			}
+			return nil
+		}
+		lastRes = res
+		if !errors.Is(err, ErrDumpInterrupted) {
+			return err
+		}
+	}
+
+	for _, msg := range lastRes {
+		if cont := f(msg); !cont {
+			break
+		}
+	}
+	return fmt.Errorf("execute netlink request after %d attempts: %w", attempts, ErrDumpInterrupted)
+}
+
 func (req *NetlinkRequest) executeIter(sockType int, resType uint16, f func(msg []byte) bool) error {
+	return req.executeIterFull(context.Background(), sockType, resType, func(msg syscall.NetlinkMessage) bool {
+		return f(msg.Data)
+	})
+}
+
+func (req *NetlinkRequest) executeIterFull(ctx context.Context, sockType int, resType uint16, f func(msg syscall.NetlinkMessage) bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	var (
 		s   *NetlinkSocket
 		err error
@@ -621,6 +690,14 @@ func (req *NetlinkRequest) executeIter(sockType int, resType uint16, f func(msg 
 		defer s.Unlock()
 	}
 
+	// Cancellation: a dedicated socket is closed when ctx is done, which
+	// interrupts a blocked Receive. A shared socket must stay usable for
+	// other requests, so there ctx is only checked between receives.
+	if ctx.Done() != nil && !sharedSocket {
+		stop := context.AfterFunc(ctx, func() { _ = s.Close() })
+		defer stop()
+	}
+
 	if err := s.Send(req); err != nil {
 		return err
 	}
@@ -634,8 +711,14 @@ func (req *NetlinkRequest) executeIter(sockType int, resType uint16, f func(msg 
 
 done:
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		msgs, from, err := s.Receive()
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return err
 		}
 		if from.Pid != PidKernel {
@@ -705,10 +788,10 @@ done:
 			if resType != 0 && m.Header.Type != resType {
 				continue
 			}
-			if cont := f(m.Data); !cont {
+			if cont := f(m); !cont {
 				// Drain the rest of the messages from the kernel but don't
 				// pass them to the iterator func.
-				f = dummyMsgIterFunc
+				f = dummyFullMsgIterFunc
 			}
 			if m.Header.Flags&unix.NLM_F_MULTI == 0 {
 				break done
@@ -721,7 +804,7 @@ done:
 	return nil
 }
 
-func dummyMsgIterFunc(msg []byte) bool {
+func dummyFullMsgIterFunc(msg syscall.NetlinkMessage) bool {
 	return true
 }
 
