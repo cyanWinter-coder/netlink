@@ -670,12 +670,14 @@ const (
 )
 
 const (
-	IFLA_XDP_UNSPEC   = iota
-	IFLA_XDP_FD       /* fd of xdp program to attach, or -1 to remove */
-	IFLA_XDP_ATTACHED /* read-only bool indicating if prog is attached */
-	IFLA_XDP_FLAGS    /* xdp prog related flags */
-	IFLA_XDP_PROG_ID  /* xdp prog id */
-	IFLA_XDP_MAX      = IFLA_XDP_PROG_ID
+	IFLA_XDP_UNSPEC      = iota
+	IFLA_XDP_FD          /* fd of xdp program to attach, or -1 to remove */
+	IFLA_XDP_ATTACHED    /* read-only bool indicating if prog is attached */
+	IFLA_XDP_FLAGS       /* xdp prog related flags */
+	IFLA_XDP_PROG_ID     /* xdp prog id */
+	IFLA_XDP_EXPECTED_FD /* fd of the program expected to be attached; the
+	kernel replaces it atomically (kernel 5.9+) */
+	IFLA_XDP_MAX = IFLA_XDP_EXPECTED_FD
 )
 
 // XDP program attach mode (used as dump value for IFLA_XDP_ATTACHED)
